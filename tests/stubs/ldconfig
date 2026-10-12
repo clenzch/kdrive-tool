@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: lists libfuse.so.2 unless STUB_MISSING contains "fuse".
+[[ " ${STUB_MISSING:-} " == *" fuse "* ]] && exit 0
+printf '\tlibfuse.so.2 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libfuse.so.2\n'

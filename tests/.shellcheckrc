@@ -1,0 +1,4 @@
+# Variables come from bats and from `load helpers`, which shellcheck cannot follow.
+shell=bash
+# Each @test runs in its own subshell; exports there are intentionally test-local.
+disable=SC2030,SC2031

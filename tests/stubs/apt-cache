@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: libfuse2t64 exists unless STUB_MISSING contains "t64".
+[[ " ${STUB_MISSING:-} " == *" t64 "* && "$*" == *libfuse2t64* ]] && exit 100
+exit 0

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Test stub for curl: serves https://HOST/PATH from $CURL_STUB_ROOT/HOST/PATH.
+# Missing file = HTTP error (exit 22, like --fail). Every call is appended to $CURL_STUB_LOG.
+set -euo pipefail
+out="" url=""
+printf '%s\n' "$*" >>"${CURL_STUB_LOG:-/dev/null}"
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	-o | --output)
+		out="$2"
+		shift
+		;;
+	--proto | --proto-redir | --max-time | --connect-timeout | --retry | -H | -w) shift ;;
+	http://* | https://*) url="$1" ;;
+	esac
+	shift
+done
+[[ -n "$url" ]] || {
+	echo "curl stub: no URL" >&2
+	exit 2
+}
+src="${CURL_STUB_ROOT:?}/${url#*://}"
+if [[ ! -f "$src" ]]; then
+	echo "curl: (22) The requested URL returned error: 404" >&2
+	exit 22
+fi
+if [[ -n "$out" ]]; then
+	cat "$src" >"$out"
+else
+	cat "$src"
+fi

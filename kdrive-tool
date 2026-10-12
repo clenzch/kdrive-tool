@@ -1,0 +1,1091 @@
+#!/usr/bin/env bash
+# kdrive-tool — install, update and roll back the Infomaniak kDrive AppImage on Ubuntu.
+#
+# Single self-contained file: everything the tool writes (desktop entry, AppArmor
+# profile, sysctl drop-in) is embedded below as heredocs.
+#
+# Safety rule: this script only writes or deletes its own files (see is_allowed), and
+# every deletion goes through safe_rm. Sync folders, ~/.config/kDrive and credentials
+# are never written. Design notes: docs/DESIGN.md.
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+readonly PROG="${0##*/}"
+
+# --- Paths -------------------------------------------------------------------
+# KDRIVE_DIR / KDRIVE_STATE_DIR are overridable for tests only.
+readonly KDRIVE_DIR="${KDRIVE_DIR:-$HOME/.local/opt/kdrive}"
+readonly STATE_DIR="${KDRIVE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/kdrive-tool}"
+readonly BIN_PATH="$HOME/.local/bin/kdrive-tool"
+readonly APP_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly TOOL_DESKTOP="$APP_DATA_DIR/applications/kdrive-tool.desktop"
+readonly ICON_PATH="$APP_DATA_DIR/icons/kdrive-tool.png"
+
+readonly ACTIVE="$KDRIVE_DIR/kDrive.AppImage"
+readonly PREV="$KDRIVE_DIR/kDrive.AppImage.prev"
+readonly NEW="$KDRIVE_DIR/kDrive.AppImage.new"
+readonly VERSION_FILE="$KDRIVE_DIR/VERSION"
+readonly PREV_VERSION_FILE="$KDRIVE_DIR/VERSION.prev"
+readonly LOG_FILE="$STATE_DIR/log"
+readonly LOCK_FILE="$STATE_DIR/lock"
+readonly TMP_DIR="$STATE_DIR/tmp"
+readonly BACKUP_DIR="$STATE_DIR/backup"
+readonly SWAP="$KDRIVE_DIR/kDrive.AppImage.swap"
+readonly KDRIVE_CONFIG_DIR="$HOME/.config/kDrive"
+readonly KDRIVE_CLIENT_CONF="$HOME/.config/com.infomaniak.drive.desktopclient/kDrive_client.conf"
+readonly KEEP_BACKUPS=3
+readonly KDRIVE_APP_DESKTOP="$APP_DATA_DIR/applications/kDrive.desktop"
+readonly KDRIVE_AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/kDrive.desktop"
+
+# System paths; KDRIVE_SYSROOT is a test-only prefix.
+readonly SYSROOT="${KDRIVE_SYSROOT:-}"
+readonly APPARMOR_DIR="$SYSROOT/etc/apparmor.d"
+readonly APPARMOR_PROFILE="$APPARMOR_DIR/kdrive-tool"
+readonly SYSCTL_CONF="$SYSROOT/etc/sysctl.d/60-kdrive-inotify.conf"
+readonly PROC_SYS="$SYSROOT/proc/sys"
+readonly INOTIFY_WATCHES=524288
+
+readonly LATEST_URL="${KDRIVE_LATEST_URL:-https://www.infomaniak.com/drive/latest}"
+readonly DOWNLOAD_HOST="download.storage.infomaniak.com"
+# Real AppImages are ~60 MB; anything below this is a truncated or wrong download.
+readonly MIN_APPIMAGE_SIZE=$((1024 * 1024))
+# How long to wait for the user to quit kDrive from the tray (KDRIVE_QUIT_TIMEOUT: tests).
+readonly QUIT_TIMEOUT="${KDRIVE_QUIT_TIMEOUT:-600}"
+
+ASSUME_YES=""
+PAUSE=""
+CLEANUP=""
+NO_LOG_FILE=""
+
+# --- Output ------------------------------------------------------------------
+log() {
+	printf '%s\n' "$*" >&2
+	if [[ -d "$STATE_DIR" && -z "$NO_LOG_FILE" ]]; then
+		printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE"
+	fi
+}
+
+die() {
+	log "error: $*"
+	exit 1
+}
+
+# --- Safety ------------------------------------------------------------------
+# Never deleted, nor anything inside them, nor any directory containing them.
+PROTECTED_PATHS=(
+	"$HOME/.config/kDrive"
+	"$HOME/.config/com.infomaniak.drive.desktopclient"
+	"$HOME/.local/share/kDrive_client"
+	"$HOME/.local/state/kDrive"
+	"$HOME/.local/share/keyrings"
+)
+
+# resolve_path PATH: absolute path with symlinks in the parent resolved; the last
+# component is kept as is, so a symlink is removed itself, not its target.
+resolve_path() {
+	local dir base
+	dir="$(dirname -- "$1")"
+	base="$(basename -- "$1")"
+	dir="$(realpath -m -- "$dir")"
+	printf '%s/%s\n' "${dir%/}" "$base"
+}
+
+# is_under PATH ROOT: PATH equals ROOT or lies below it.
+is_under() {
+	[[ "$1" == "$2" || "$1" == "$2"/* ]]
+}
+
+# is_protected PATH (resolved): true for HOME, /, protected paths, their contents and
+# their ancestors, and anything inside a kDrive sync folder cache.
+is_protected() {
+	local p="$1" home prot
+	home="$(realpath -m -- "$HOME")"
+	[[ "$p" == / || "$p" == "$home" || "$p" == */.kDrive-cache || "$p" == */.kDrive-cache/* ]] && return 0
+	is_under "$home" "$p" && return 0
+	for prot in "${PROTECTED_PATHS[@]}"; do
+		prot="$(realpath -m -- "$prot")"
+		is_under "$p" "$prot" || is_under "$prot" "$p" && return 0
+	done
+	return 1
+}
+
+# is_allowed PATH (resolved): inside the tool's own directories or one of its files.
+is_allowed() {
+	local p="$1" root
+	for root in "$KDRIVE_DIR" "$STATE_DIR"; do
+		root="$(realpath -m -- "$root")"
+		# A misconfigured override (KDRIVE_DIR=$HOME, ...) must not widen the allowlist.
+		is_protected "$root" && continue
+		is_under "$p" "$root" && return 0
+	done
+	for root in "$BIN_PATH" "$TOOL_DESKTOP" "$ICON_PATH" "$APPARMOR_PROFILE" "$SYSCTL_CONF"; do
+		[[ "$p" == "$(resolve_path "$root")" ]] && return 0
+	done
+	return 1
+}
+
+# safe_rm [--sudo] PATH...: the only way this script deletes anything. Refuses (and
+# exits) for any path outside the allowlist. Missing paths are fine. --sudo removes
+# root-owned files (never directories).
+safe_rm() {
+	local arg p sudo=""
+	if [[ "${1:-}" == --sudo ]]; then
+		sudo=1
+		shift
+	fi
+	for arg in "$@"; do
+		[[ "$arg" == /* ]] || die "safe_rm: refusing non-absolute path: '$arg'"
+		case "$(basename -- "$arg")" in . | .. | /) die "safe_rm: refusing: $arg" ;; esac
+		p="$(resolve_path "$arg")"
+		if is_protected "$p" || ! is_allowed "$p"; then
+			die "safe_rm: refusing to delete outside allowlist: $p"
+		fi
+		if [[ -n "$sudo" ]]; then
+			[[ ! -d "$p" || -L "$p" ]] || die "safe_rm: refusing to delete a directory as root: $p"
+			[[ ! -e "$p" && ! -L "$p" ]] || sudo rm -f -- "$p"
+		elif [[ -d "$p" && ! -L "$p" ]]; then
+			rm -rf --one-file-system -- "$p"
+		elif [[ -e "$p" || -L "$p" ]]; then
+			rm -f -- "$p"
+		fi
+	done
+}
+
+# acquire_lock: one mutating kdrive-tool at a time. Held on fd 9 until the process exits;
+# anything long-lived started from here must close fd 9 (9>&-), or it keeps the lock.
+acquire_lock() {
+	mkdir -p "$STATE_DIR"
+	chmod 700 "$STATE_DIR"
+	exec 9>"$LOCK_FILE"
+	flock -n 9 || die "another $PROG is already running (lock: $LOCK_FILE)"
+}
+
+# --- Latest version lookup ---------------------------------------------------
+# map_arch MACHINE: uname -m value -> drive/latest key suffix.
+map_arch() {
+	case "$1" in
+	x86_64 | amd64) echo amd64 ;;
+	aarch64 | arm64) echo arm64 ;;
+	*) die "unsupported architecture: $1 (kDrive ships amd64 and arm64 only)" ;;
+	esac
+}
+
+# detect_arch: KDRIVE_ARCH is a test-only override.
+detect_arch() {
+	map_arch "${KDRIVE_ARCH:-$(uname -m)}"
+}
+
+# KDRIVE_FORCE_PYTHON is a test-only switch to exercise the python3 fallback.
+have_jq() {
+	[[ -z "${KDRIVE_FORCE_PYTHON:-}" ]] && command -v jq >/dev/null
+}
+
+# json_get KEY1 KEY2 < JSON: print the string at .[KEY1][KEY2], or nothing if absent.
+# Fails on invalid JSON.
+json_get() {
+	if have_jq; then
+		jq -r --arg a "$1" --arg b "$2" '(.[$a][$b])? // empty | strings'
+	else
+		python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+v = d.get(sys.argv[1]) if isinstance(d, dict) else None
+v = v.get(sys.argv[2]) if isinstance(v, dict) else None
+if isinstance(v, str):
+    print(v)
+' "$1" "$2"
+	fi
+}
+
+valid_version() {
+	[[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ ]]
+}
+
+# valid_download_url URL: https, exact host, plain path ending in .AppImage.
+valid_download_url() {
+	local url="$1" rest host path
+	[[ "$url" == https://* ]] || return 1
+	rest="${url#https://}"
+	host="${rest%%/*}"
+	path="${rest#"$host"}"
+	[[ "$host" == "$DOWNLOAD_HOST" ]] || return 1
+	[[ "$path" =~ ^/[A-Za-z0-9._/-]+\.AppImage$ && "$path" != *..* ]]
+}
+
+# version_gt A B: true if version A is newer than B (both a.b.c.d).
+version_gt() {
+	local -a a b
+	local i
+	IFS=. read -ra a <<<"$1"
+	IFS=. read -ra b <<<"$2"
+	for i in 0 1 2 3; do
+		((10#${a[i]:-0} > 10#${b[i]:-0})) && return 0
+		((10#${a[i]:-0} < 10#${b[i]:-0})) && return 1
+	done
+	return 1
+}
+
+# fetch_latest: query drive/latest and set LATEST_VERSION and LATEST_DOWNLOAD_URL
+# for this machine's architecture. Dies unless everything validates.
+fetch_latest() {
+	local arch json version url
+	arch="$(detect_arch)"
+	[[ "$LATEST_URL" == https://* ]] || die "refusing non-https update URL: $LATEST_URL"
+	json="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+		--max-time 30 "$LATEST_URL")" || die "could not fetch $LATEST_URL"
+	version="$(json_get "linux-$arch" version <<<"$json")" ||
+		die "invalid JSON from $LATEST_URL"
+	url="$(json_get "linux-$arch" downloadurl <<<"$json")" ||
+		die "invalid JSON from $LATEST_URL"
+	[[ -n "$version" && -n "$url" ]] || die "no linux-$arch release listed at $LATEST_URL"
+	valid_version "$version" || die "unexpected version format from $LATEST_URL: '$version'"
+	valid_download_url "$url" || die "refusing download URL (expected https://$DOWNLOAD_HOST/...AppImage): $url"
+	LATEST_VERSION="$version"
+	LATEST_DOWNLOAD_URL="$url"
+}
+
+# --- Download and verification -----------------------------------------------
+# check_appimage FILE ARCH: ELF for ARCH with the AppImage type-2 magic, plausible size.
+check_appimage() {
+	local file="$1" arch="$2" header want size
+	[[ -f "$file" ]] || die "not a file: $file"
+	size="$(stat -c %s -- "$file")"
+	((size >= MIN_APPIMAGE_SIZE)) || die "too small for an AppImage ($size bytes): $file"
+	# Bytes 0-3 ELF magic, 8-10 "AI\x02", 18 e_machine (0x3e x86-64, 0xb7 aarch64).
+	header="$(od -An -tx1 -N19 -- "$file" | tr -d ' \n')"
+	case "$arch" in
+	amd64) want=3e ;;
+	arm64) want=b7 ;;
+	esac
+	[[ "${header:0:8}" == 7f454c46 ]] || die "not an ELF file: $file"
+	[[ "${header:16:6}" == 414902 ]] || die "not a type-2 AppImage: $file"
+	[[ "${header:36:2}" == "$want" ]] || die "AppImage is not built for $arch: $file"
+}
+
+# curl_get URL [OUTFILE]: https-only download; stdout if no OUTFILE.
+curl_get() {
+	local -a args=(--fail --silent --show-error --location --proto '=https' --proto-redir '=https')
+	if [[ $# -gt 1 ]]; then
+		[[ -t 2 ]] && args=(--fail --progress-bar --show-error --location --proto '=https' --proto-redir '=https')
+		curl "${args[@]}" --connect-timeout 30 -o "$2" "$1"
+	else
+		curl "${args[@]}" --max-time 30 "$1"
+	fi
+}
+
+# fetch_sha256 URL: print the checksum published at URL.sha256 ("<hex>  <name>").
+fetch_sha256() {
+	local sum
+	sum="$(curl_get "$1.sha256")" || return 1
+	sum="${sum%%[[:space:]]*}"
+	sum="${sum,,}"
+	[[ "$sum" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$sum"
+}
+
+# verify_sha256 FILE SUM
+verify_sha256() {
+	local actual
+	actual="$(sha256sum -- "$1")"
+	[[ "${actual%% *}" == "$2" ]]
+}
+
+# download_and_verify URL ARCH: download to $NEW, check SHA-256 and AppImage header.
+download_and_verify() {
+	local url="$1" arch="$2" sum
+	command -v curl >/dev/null || die "curl is required (sudo apt install curl)"
+	sum="$(fetch_sha256 "$url")" || die "could not fetch checksum $url.sha256"
+	mkdir -p "$KDRIVE_DIR"
+	log "downloading $url"
+	curl_get "$url" "$NEW" || die "download failed: $url"
+	verify_sha256 "$NEW" "$sum" || die "SHA-256 mismatch for $url (download corrupted?)"
+	check_appimage "$NEW" "$arch"
+	chmod 755 "$NEW"
+}
+
+# copy_local FILE VERSION ARCH: copy (never move) an existing AppImage to $NEW and check it.
+# If Infomaniak publishes a checksum for that version, it must match.
+copy_local() {
+	local src="$1" version="$2" arch="$3" sum
+	[[ -f "$src" ]] || die "no such file: $src"
+	check_appimage "$src" "$arch"
+	mkdir -p "$KDRIVE_DIR"
+	cp -- "$src" "$NEW"
+	chmod 755 "$NEW"
+	if command -v curl >/dev/null &&
+		sum="$(fetch_sha256 "https://$DOWNLOAD_HOST/drive/desktopclient/kDrive-$version-$arch.AppImage")"; then
+		verify_sha256 "$NEW" "$sum" || die "SHA-256 of $src does not match the published kDrive $version"
+		log "checksum matches published kDrive $version"
+	else
+		log "warning: could not fetch the published checksum for $version; checked headers only"
+	fi
+}
+
+installed_version() {
+	local v=""
+	[[ -f "$VERSION_FILE" ]] && read -r v <"$VERSION_FILE"
+	valid_version "$v" && printf '%s\n' "$v"
+}
+
+# write_file PATH < CONTENT: replace PATH atomically.
+write_file() {
+	cat >"$1.tmp"
+	mv -f -- "$1.tmp" "$1"
+}
+
+# activate_new VERSION: make $NEW the active AppImage. The old one is hard-linked to
+# .prev first, so the active path never disappears, and the swap is a single rename.
+activate_new() {
+	local version="$1" current
+	[[ -f "$NEW" ]] || die "nothing to activate"
+	backup_config
+	if [[ -e "$ACTIVE" ]]; then
+		current="$(installed_version)" || current=""
+		safe_rm "$PREV" "$PREV_VERSION_FILE"
+		ln -- "$ACTIVE" "$PREV"
+		[[ -n "$current" ]] && printf '%s\n' "$current" | write_file "$PREV_VERSION_FILE"
+	fi
+	mv -f -- "$NEW" "$ACTIVE"
+	printf '%s\n' "$version" | write_file "$VERSION_FILE"
+	log "kDrive $version is now at $ACTIVE"
+}
+
+# --- Config backup -----------------------------------------------------------
+# backup_db SRC DESTDIR: copy a SQLite DB and its WAL with plain cp (SQLite itself would
+# create -wal/-shm files next to the original, even read-only), then fold the WAL into
+# the copy and check it. A copy torn by kDrive writing mid-copy is kept but flagged.
+backup_db() {
+	local src="$1" destdir="$2" copy f
+	copy="$destdir/$(basename -- "$src")"
+	for f in "$src" "$src-wal"; do
+		[[ ! -f "$f" ]] || cp -p -- "$f" "$destdir/"
+	done
+	python3 -c '
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+ok = c.execute("pragma quick_check").fetchone()[0] == "ok"
+c.execute("pragma wal_checkpoint(TRUNCATE)")
+c.close()
+sys.exit(0 if ok else 1)
+' "$copy" 2>/dev/null && return 0
+	# SQLite may have altered the copy; keep untouched raw copies for manual recovery.
+	for f in "$src" "$src-wal"; do
+		[[ ! -f "$f" ]] || cp -p -- "$f" "$destdir/"
+	done
+	log "warning: backup of $(basename -- "$src") may be inconsistent (kDrive was writing?)"
+}
+
+# backup_config: read-only copy of kDrive's DBs and client conf to
+# $BACKUP_DIR/<timestamp>/, keeping the newest $KEEP_BACKUPS. Synced files are not copied.
+backup_config() {
+	local dest db n=0 old
+	[[ -d "$KDRIVE_CONFIG_DIR" ]] || return 0
+	dest="$BACKUP_DIR/$(date +%Y%m%dT%H%M%S)"
+	[[ -e "$dest" ]] && return 0
+	mkdir -p "$dest"
+	chmod 700 "$BACKUP_DIR" "$dest"
+	for db in "$KDRIVE_CONFIG_DIR"/.*.db "$KDRIVE_CONFIG_DIR"/*.db; do
+		[[ -f "$db" ]] && backup_db "$db" "$dest"
+	done
+	[[ -f "$KDRIVE_CLIENT_CONF" ]] && cp -p -- "$KDRIVE_CLIENT_CONF" "$dest/"
+	log "backed up kDrive config to $dest"
+	while IFS= read -r old; do
+		n=$((n + 1))
+		((n > KEEP_BACKUPS)) && safe_rm "$old"
+	done < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort -r)
+	return 0
+}
+
+# --- Desktop integration -------------------------------------------------------
+# extract_icon: copy the 256px icon out of the active AppImage (best effort).
+extract_icon() {
+	local icon
+	safe_rm "$TMP_DIR"
+	mkdir -p "$TMP_DIR" "$(dirname "$ICON_PATH")"
+	if (cd "$TMP_DIR" && timeout 60 "$ACTIVE" --appimage-extract \
+		'usr/share/icons/hicolor/256x256/apps/*.png' >/dev/null 2>&1 9>&-); then
+		icon="$(find "$TMP_DIR/squashfs-root" -type f -name '*.png' -print -quit)"
+		[[ -n "$icon" ]] && install -m 644 -- "$icon" "$ICON_PATH"
+	fi
+	safe_rm "$TMP_DIR"
+	[[ -f "$ICON_PATH" ]] || log "warning: could not extract the kDrive icon"
+}
+
+# write_tool_desktop: the tool's own app-grid entry. kDrive rewrites its own entries on
+# every start, so update/rollback live in a separate entry this tool owns. No MimeType,
+# so no update-desktop-database (it would write mimeinfo.cache outside the allowlist).
+write_tool_desktop() {
+	local icon=kdrive
+	[[ -f "$ICON_PATH" ]] && icon="$ICON_PATH"
+	mkdir -p "$(dirname "$TOOL_DESKTOP")"
+	write_file "$TOOL_DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Update kDrive
+Comment=Install the latest kDrive version
+Exec="$BIN_PATH" --pause update
+Icon=$icon
+Terminal=true
+Categories=Network;
+Actions=start;rollback;status;
+
+[Desktop Action start]
+Name=Start kDrive
+Exec="$ACTIVE"
+
+[Desktop Action rollback]
+Name=Roll back to previous kDrive version
+Exec="$BIN_PATH" --pause rollback
+
+[Desktop Action status]
+Name=Show kDrive status
+Exec="$BIN_PATH" --pause status
+EOF
+}
+
+# install_self: copy this script to $BIN_PATH (unless running from there).
+install_self() {
+	local src
+	src="$(realpath -- "${BASH_SOURCE[0]}")"
+	[[ "$src" == "$(realpath -m -- "$BIN_PATH")" ]] && return 0
+	mkdir -p "$(dirname "$BIN_PATH")"
+	install -m 755 -- "$src" "$BIN_PATH"
+	case ":$PATH:" in
+	*":$(dirname "$BIN_PATH"):"*) ;;
+	*) log "note: $(dirname "$BIN_PATH") is not in your PATH" ;;
+	esac
+}
+
+# --- Process handling ----------------------------------------------------------
+kdrive_running() {
+	pgrep -x kDrive_client >/dev/null
+}
+
+launch_kdrive() {
+	# 9>&-: kDrive must not inherit the lock, or it blocks the next update until it exits.
+	setsid -f "$ACTIVE" >/dev/null 2>&1 </dev/null 9>&-
+	log "started kDrive from $ACTIVE"
+}
+
+# notify MESSAGE: log, plus a desktop notification when there is no terminal.
+notify() {
+	log "$*"
+	if [[ ! -t 2 ]] && command -v notify-send >/dev/null; then
+		notify-send -a kdrive-tool kDrive "$*" 2>/dev/null || true
+	fi
+}
+
+# wait_for_quit: true once kDrive has exited, false after $QUIT_TIMEOUT seconds.
+wait_for_quit() {
+	local waited=0
+	while kdrive_running; do
+		((waited >= QUIT_TIMEOUT)) && return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+}
+
+# offer_start VERSION: start kDrive if the user agrees (it is not running).
+offer_start() {
+	if confirm "Start kDrive $1 now?"; then
+		launch_kdrive
+	else
+		log "start kDrive with: $ACTIVE"
+	fi
+}
+
+# restart_kdrive VERSION: get kDrive running on the active AppImage. kDrive has no
+# scriptable quit and does not handle SIGTERM (it would just die mid-sync), so the user
+# quits it from the tray; this tool waits and starts the new version. Never sends signals.
+restart_kdrive() {
+	local version="$1"
+	if ! kdrive_running; then
+		offer_start "$version"
+		return 0
+	fi
+	if ! confirm "Restart kDrive now to use $version? (you quit it from the tray, then it is started again)"; then
+		notify "kDrive $version is installed. Quit and restart kDrive to use it."
+		return 0
+	fi
+	notify "Quit kDrive from its tray icon menu. Waiting up to $((QUIT_TIMEOUT / 60)) min..."
+	if ! wait_for_quit; then
+		notify "kDrive is still running. Quit and restart it yourself to use $version."
+		return 0
+	fi
+	launch_kdrive
+	notify "kDrive $version started."
+}
+
+# confirm QUESTION: yes with --yes; no without a terminal; otherwise ask.
+confirm() {
+	[[ -n "$ASSUME_YES" ]] && return 0
+	[[ -t 0 ]] || return 1
+	local reply
+	read -r -p "$1 [y/N] " reply
+	[[ "$reply" == [yY]* ]]
+}
+
+on_exit() {
+	local rc=$?
+	# Only the lock holder may clean up; a read-only command must not remove the
+	# .new of an update running in parallel.
+	if [[ -n "$CLEANUP" ]] && [[ -e "$NEW" || -e "$VERSION_FILE.tmp" || -e "$TMP_DIR" ]]; then
+		safe_rm "$NEW" "$VERSION_FILE.tmp" "$PREV_VERSION_FILE.tmp" "$TMP_DIR"
+	fi
+	if [[ -n "$PAUSE" && -t 0 ]]; then
+		read -r -p "Press Enter to close. " _ || true
+	fi
+	exit "$rc"
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG [--pause] <command> [options]
+
+Commands:
+  install [--from FILE [--version V]] [--force] [--yes]
+                          Install kDrive to $KDRIVE_DIR (downloads latest, or copies FILE)
+  update [--yes] [--force]
+                          Install the latest version if newer, then offer to restart kDrive
+  rollback [--yes]        Switch back to the previous version
+  status                  Show installed/latest version and setup state
+  doctor                  Check prerequisites and known issues (changes nothing)
+  system [--yes]          Machine-wide setup via sudo, asks per step
+  uninstall [--yes]       Remove what this tool installed (never sync data or config)
+  version                 Print the tool version
+  help                    Show this help
+
+Options:
+  --pause                 Wait for Enter before exiting (used by the desktop entry)
+EOF
+}
+
+# --- install / update / rollback -------------------------------------------------
+cmd_install() {
+	local from="" version="" force="" arch current
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--from)
+			from="${2:?--from needs a file}"
+			shift
+			;;
+		--version)
+			version="${2:?--version needs a version}"
+			shift
+			;;
+		--force) force=1 ;;
+		--yes | -y) ASSUME_YES=1 ;;
+		*) die "install: unknown option: $1" ;;
+		esac
+		shift
+	done
+	[[ -z "$version" || -n "$from" ]] || die "install: --version only applies with --from"
+	arch="$(detect_arch)"
+	current="$(installed_version)" || current=""
+
+	if [[ -n "$from" ]]; then
+		if [[ -z "$version" && "$(basename -- "$from")" =~ ^kDrive-([0-9]+(\.[0-9]+){3})- ]]; then
+			version="${BASH_REMATCH[1]}"
+		fi
+		[[ -n "$version" ]] || die "cannot tell the version from '$from'; pass --version X.Y.Z.W"
+		valid_version "$version" || die "invalid version: $version"
+		if [[ "$version" == "$current" && -z "$force" ]]; then
+			log "kDrive $version is already installed"
+		elif [[ -n "$current" && -z "$force" ]] && version_gt "$current" "$version"; then
+			die "installed $current is newer than $version; use --force to downgrade"
+		else
+			copy_local "$from" "$version" "$arch"
+			activate_new "$version"
+		fi
+	elif [[ -n "$current" && -z "$force" ]]; then
+		log "kDrive $current is already installed (use '$PROG update' for newer versions)"
+	else
+		fetch_latest
+		download_and_verify "$LATEST_DOWNLOAD_URL" "$arch"
+		activate_new "$LATEST_VERSION"
+	fi
+
+	install_self
+	extract_icon
+	write_tool_desktop
+
+	if kdrive_running; then
+		log "kDrive is running. Quit it from the tray icon, then start: $ACTIVE"
+	else
+		offer_start "$(installed_version || echo)"
+	fi
+}
+cmd_update() {
+	local force="" arch current
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--force) force=1 ;;
+		--yes | -y) ASSUME_YES=1 ;;
+		*) die "update: unknown option: $1" ;;
+		esac
+		shift
+	done
+	current="$(installed_version)" || die "kDrive is not installed by $PROG; run '$PROG install' first"
+	[[ -f "$ACTIVE" ]] || die "$ACTIVE is missing; run '$PROG install --force'"
+	arch="$(detect_arch)"
+	fetch_latest
+	if [[ "$LATEST_VERSION" == "$current" && -z "$force" ]]; then
+		log "kDrive $current is up to date"
+		kdrive_running || offer_start "$current"
+		return 0
+	fi
+	if ! version_gt "$LATEST_VERSION" "$current" && [[ -z "$force" ]]; then
+		log "installed $current is newer than the published $LATEST_VERSION; nothing to do (--force to downgrade)"
+		kdrive_running || offer_start "$current"
+		return 0
+	fi
+	log "updating kDrive $current -> $LATEST_VERSION"
+	download_and_verify "$LATEST_DOWNLOAD_URL" "$arch"
+	activate_new "$LATEST_VERSION"
+	restart_kdrive "$LATEST_VERSION"
+}
+
+# recover_swap: finish or undo a rollback that was interrupted between renames.
+recover_swap() {
+	[[ -e "$SWAP" ]] || return 0
+	if [[ -e "$PREV" ]]; then
+		safe_rm "$SWAP"
+	else
+		mv -- "$SWAP" "$PREV"
+	fi
+}
+
+cmd_rollback() {
+	local arch current previous
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--yes | -y) ASSUME_YES=1 ;;
+		*) die "rollback: unknown option: $1" ;;
+		esac
+		shift
+	done
+	recover_swap
+	[[ -f "$PREV" ]] || die "no previous version to roll back to"
+	arch="$(detect_arch)"
+	check_appimage "$PREV" "$arch"
+	current="$(installed_version)" || current=""
+	previous=""
+	[[ -f "$PREV_VERSION_FILE" ]] && read -r previous <"$PREV_VERSION_FILE"
+	valid_version "$previous" || previous=unknown
+	backup_config
+	# Swap without the active path ever disappearing: keep the old active via a hard
+	# link, rename .prev over it, then move the link to .prev.
+	if [[ -e "$ACTIVE" ]]; then
+		ln -- "$ACTIVE" "$SWAP"
+		mv -f -- "$PREV" "$ACTIVE"
+		mv -- "$SWAP" "$PREV"
+	else
+		mv -- "$PREV" "$ACTIVE"
+	fi
+	if [[ "$previous" != unknown ]]; then
+		printf '%s\n' "$previous" | write_file "$VERSION_FILE"
+	else
+		safe_rm "$VERSION_FILE"
+	fi
+	if [[ -n "$current" ]]; then
+		printf '%s\n' "$current" | write_file "$PREV_VERSION_FILE"
+	else
+		safe_rm "$PREV_VERSION_FILE"
+	fi
+	log "rolled back to kDrive $previous (${current:-unknown} is kept as previous)"
+	restart_kdrive "$previous"
+}
+# --- status / doctor (read-only) -----------------------------------------------
+PROBLEMS=0
+
+# use_color: colored marks on a terminal; NO_COLOR disables, CLICOLOR_FORCE=1 forces.
+use_color() {
+	[[ -z "${NO_COLOR:-}" ]] || return 1
+	[[ "${CLICOLOR_FORCE:-}" == 1 ]] && return 0
+	[[ -t 1 && "${TERM:-dumb}" != dumb ]]
+}
+
+# report ok|info|warn|fail LABEL MESSAGE [HINT]. fail makes status/doctor exit 1.
+report() {
+	local mark color
+	case "$1" in
+	ok) mark=" ok " color='32' ;;
+	info) mark="info" color='33' ;;
+	warn) mark="warn" color='1;33' ;;
+	fail)
+		mark="FAIL" color='1;31'
+		PROBLEMS=$((PROBLEMS + 1))
+		;;
+	esac
+	use_color && mark=$'\e['"${color}m$mark"$'\e[0m'
+	printf '[%s] %-14s %s\n' "$mark" "$2" "$3"
+	[[ -z "${4:-}" ]] || printf '%22s-> %s\n' "" "$4"
+}
+
+# desktop_exec FILE: the program path from the entry's Exec= line (quotes, args dropped).
+desktop_exec() {
+	local line
+	line="$(grep -m1 '^Exec=' -- "$1" 2>/dev/null)" || return 0
+	line="${line#Exec=}"
+	case "$line" in
+	\"*)
+		line="${line#\"}"
+		printf '%s\n' "${line%%\"*}"
+		;;
+	\'*)
+		line="${line#\'}"
+		printf '%s\n' "${line%%\'*}"
+		;;
+	*) printf '%s\n' "${line%% *}" ;;
+	esac
+}
+
+# running_appimage: path of the AppImage the running kDrive was started from, if known.
+running_appimage() {
+	local pid line
+	pid="$(pgrep -x kDrive_client | head -n1)" || return 0
+	[[ -r "/proc/$pid/environ" ]] || return 0
+	while IFS= read -r -d '' line; do
+		[[ "$line" == APPIMAGE=* ]] && printf '%s\n' "${line#APPIMAGE=}"
+	done <"/proc/$pid/environ"
+	return 0
+}
+
+# legacy_leftovers: files from manual installs, one per line. Listed, never removed.
+legacy_leftovers() {
+	local d f
+	for d in "$HOME" "$HOME/.applications" "$HOME/Applications" "$HOME/Downloads" "$HOME/.local/bin"; do
+		[[ -d "$d" ]] || continue
+		find "$d" -maxdepth 1 -type f -iname 'kDrive*.AppImage' 2>/dev/null
+	done
+	[[ ! -e "$HOME/.local/bin/kdrive-launch" ]] || echo "$HOME/.local/bin/kdrive-launch"
+	for f in "$APP_DATA_DIR"/applications/*.desktop; do
+		[[ -f "$f" && "$f" != "$KDRIVE_APP_DESKTOP" && "$f" != "$TOOL_DESKTOP" ]] || continue
+		grep -qiE '^Exec=.*kDrive[^/]*\.AppImage' -- "$f" && echo "$f"
+	done
+	if [[ -d "$APPARMOR_DIR" ]]; then
+		find "$APPARMOR_DIR" -maxdepth 1 -type f -iname '*kdrive*' ! -name kdrive-tool 2>/dev/null
+	fi
+	return 0
+}
+
+check_entry() {
+	local label="$1" file="$2" missing_msg="$3" target
+	if [[ ! -f "$file" ]]; then
+		report info "$label" "$missing_msg"
+		return 0
+	fi
+	target="$(desktop_exec "$file")"
+	if [[ "$target" == "$ACTIVE" ]]; then
+		report ok "$label" "starts $ACTIVE"
+	else
+		report warn "$label" "starts ${target:-?} (not the fixed path)" \
+			"start kDrive once from $ACTIVE; it rewrites ${file/#"$HOME"/\~}"
+	fi
+}
+
+status_checks() {
+	local arch current previous="" latest running f
+	arch="$(detect_arch)"
+	current="$(installed_version)" || current=""
+	if [[ -z "$current" || ! -f "$ACTIVE" ]]; then
+		report fail installed "no kDrive installed by $PROG in $KDRIVE_DIR" "$PROG install"
+	elif ! (check_appimage "$ACTIVE" "$arch") 2>/dev/null; then
+		report fail installed "$ACTIVE is not a valid AppImage" "$PROG install --force"
+	else
+		report ok installed "kDrive $current ($ACTIVE)"
+	fi
+	[[ ! -f "$PREV_VERSION_FILE" ]] || read -r previous <"$PREV_VERSION_FILE"
+	[[ ! -f "$PREV" ]] || report info previous "kDrive ${previous:-?} (for '$PROG rollback')"
+
+	if latest="$(fetch_latest 2>/dev/null && printf '%s\n' "$LATEST_VERSION")"; then
+		if [[ -z "$current" || "$latest" == "$current" ]]; then
+			report ok latest "kDrive $latest"
+		elif version_gt "$latest" "$current"; then
+			report warn latest "kDrive $latest is available" "$PROG update"
+		else
+			report ok latest "kDrive $latest (installed is newer)"
+		fi
+	else
+		report warn latest "could not check $LATEST_URL (offline?)"
+	fi
+
+	if kdrive_running; then
+		running="$(running_appimage)"
+		if [[ -z "$running" || "$running" == "$ACTIVE" ]]; then
+			report ok running "kDrive is running${running:+ from $running}"
+		else
+			report warn running "kDrive is running from $running" \
+				"quit it from the tray, then start $ACTIVE"
+		fi
+	else
+		report info running "kDrive is not running"
+	fi
+
+	check_entry "app entry" "$KDRIVE_APP_DESKTOP" "none yet (kDrive creates it when started)"
+	check_entry autostart "$KDRIVE_AUTOSTART" "none (kDrive creates it when started, if autostart is on)"
+	if [[ -f "$TOOL_DESKTOP" ]]; then
+		report ok "update entry" "$TOOL_DESKTOP"
+	else
+		report warn "update entry" "missing" "$PROG install"
+	fi
+
+	while IFS= read -r f; do
+		report info leftover "$f" "remove by hand once the new setup works (docs/migration.md)"
+	done < <(legacy_leftovers)
+}
+
+# Probe output is captured before matching: with pipefail, `cmd | grep -q` fails when
+# grep exits early and cmd dies of SIGPIPE.
+doctor_checks() {
+	local value out
+	out="$(ldconfig -p 2>/dev/null)" || out=""
+	if [[ "$out" == *$'\tlibfuse.so.2 '* ]]; then
+		report ok libfuse2 "present"
+	else
+		report fail libfuse2 "libfuse.so.2 not found (AppImages need it)" "$PROG system (installs libfuse2t64)"
+	fi
+
+	if ! command -v busctl >/dev/null; then
+		report warn keyring "cannot check (busctl missing)"
+	elif out="$(busctl --user list --no-pager 2>/dev/null)" &&
+		[[ $'\n'"$out" == *$'\norg.freedesktop.secrets '* ]]; then
+		report ok keyring "secret service available"
+	else
+		report fail keyring "no secret service on the session bus (kDrive cannot store its login)" \
+			"install gnome-keyring and make sure it is unlocked at login"
+	fi
+
+	if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
+		out="$(gnome-extensions list --enabled 2>/dev/null)" || out=""
+		if [[ "${out,,}" == *appindicator* ]]; then
+			report ok "tray icon" "AppIndicator extension enabled"
+		else
+			report warn "tray icon" "no AppIndicator extension enabled (no kDrive tray icon)" \
+				"gnome-extensions enable ubuntu-appindicators@ubuntu.com (or install gnome-shell-extension-appindicator)"
+		fi
+	fi
+
+	value="$(cat "$PROC_SYS/fs/inotify/max_user_watches" 2>/dev/null)" || value=""
+	if [[ "$value" =~ ^[0-9]+$ ]] && ((value >= INOTIFY_WATCHES)); then
+		report ok inotify "max_user_watches=$value"
+	else
+		report warn inotify "max_user_watches=${value:-?} (large syncs need $INOTIFY_WATCHES)" "$PROG system"
+	fi
+
+	value="$(cat "$PROC_SYS/kernel/apparmor_restrict_unprivileged_userns" 2>/dev/null)" || value=0
+	if [[ "$value" != 1 ]]; then
+		report ok apparmor "unprivileged user namespaces not restricted"
+	elif [[ -f "$APPARMOR_PROFILE" ]]; then
+		report ok apparmor "profile $APPARMOR_PROFILE"
+	else
+		report warn apparmor "user namespaces restricted and no kdrive-tool profile (login window may fail)" \
+			"$PROG system"
+	fi
+
+	if [[ "${XDG_SESSION_TYPE:-}" == wayland ]]; then
+		report info wayland "if kDrive crashes at start, try: QT_QPA_PLATFORM=xcb $ACTIVE"
+	fi
+}
+
+cmd_status() {
+	[[ $# -eq 0 ]] || die "status: unknown option: $1"
+	status_checks
+	((PROBLEMS == 0))
+}
+
+cmd_doctor() {
+	[[ $# -eq 0 ]] || die "doctor: unknown option: $1"
+	status_checks
+	doctor_checks
+	((PROBLEMS == 0))
+}
+# --- system / uninstall --------------------------------------------------------
+# sudo_write PATH < CONTENT: write a root-owned file (mode 644).
+sudo_write() {
+	sudo mkdir -p -- "$(dirname "$1")"
+	sudo tee -- "$1" >/dev/null
+	sudo chmod 644 -- "$1"
+}
+
+# apparmor_profile: lets the AppImage at its fixed path create user namespaces
+# (needed by kDrive's embedded browser when kernel.apparmor_restrict_unprivileged_userns=1).
+apparmor_profile() {
+	cat <<EOF
+# Managed by kdrive-tool; removed by 'kdrive-tool uninstall'.
+# Allows the kDrive AppImage at its fixed path to use unprivileged user namespaces.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile kdrive-tool "$ACTIVE" flags=(unconfined) {
+  userns,
+
+  include if exists <local/kdrive-tool>
+}
+EOF
+}
+
+sysctl_conf() {
+	cat <<EOF
+# Managed by kdrive-tool; removed by 'kdrive-tool uninstall'.
+# kDrive watches every synced folder with inotify; large syncs exceed the default.
+fs.inotify.max_user_watches = $INOTIFY_WATCHES
+EOF
+}
+
+# missing_packages: apt packages kDrive needs that are not installed.
+missing_packages() {
+	local pkg fuse=libfuse2t64
+	apt-cache show libfuse2t64 >/dev/null 2>&1 || fuse=libfuse2
+	for pkg in "$fuse" gnome-keyring; do
+		[[ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null)" == "install ok installed" ]] ||
+			printf '%s\n' "$pkg"
+	done
+}
+
+system_packages() {
+	local -a pkgs
+	mapfile -t pkgs < <(missing_packages)
+	if [[ ${#pkgs[@]} -eq 0 ]]; then
+		log "packages: all present"
+	elif confirm "Install ${pkgs[*]} (sudo apt-get install)?"; then
+		sudo apt-get install -y -- "${pkgs[@]}"
+	else
+		log "packages: skipped (missing: ${pkgs[*]})"
+	fi
+}
+
+system_apparmor() {
+	local restricted f
+	restricted="$(cat "$PROC_SYS/kernel/apparmor_restrict_unprivileged_userns" 2>/dev/null)" || restricted=0
+	if [[ "$restricted" != 1 ]]; then
+		log "apparmor: user namespaces are not restricted, no profile needed"
+	elif [[ -f "$APPARMOR_PROFILE" && "$(cat "$APPARMOR_PROFILE")" == "$(apparmor_profile)" ]]; then
+		log "apparmor: profile up to date ($APPARMOR_PROFILE)"
+	elif confirm "Write AppArmor profile $APPARMOR_PROFILE for $ACTIVE and load it?"; then
+		apparmor_profile | sudo_write "$APPARMOR_PROFILE"
+		sudo apparmor_parser -r -- "$APPARMOR_PROFILE"
+		log "apparmor: profile loaded"
+	else
+		log "apparmor: skipped"
+	fi
+	while IFS= read -r f; do
+		[[ "$f" == "$APPARMOR_DIR"/* ]] || continue
+		log "apparmor: other kDrive profile found (not removed): $f"
+	done < <(legacy_leftovers)
+}
+
+system_inotify() {
+	local value
+	value="$(cat "$PROC_SYS/fs/inotify/max_user_watches" 2>/dev/null)" || value=0
+	if [[ "$value" =~ ^[0-9]+$ ]] && ((value >= INOTIFY_WATCHES)); then
+		log "inotify: max_user_watches=$value"
+	elif [[ -f "$SYSCTL_CONF" && "$(cat "$SYSCTL_CONF")" == "$(sysctl_conf)" ]]; then
+		log "inotify: $SYSCTL_CONF present, applying"
+		sudo sysctl -q -p "$SYSCTL_CONF"
+	elif confirm "Raise inotify max_user_watches from $value to $INOTIFY_WATCHES ($SYSCTL_CONF)?"; then
+		sysctl_conf | sudo_write "$SYSCTL_CONF"
+		sudo sysctl -q -p "$SYSCTL_CONF"
+		log "inotify: max_user_watches=$INOTIFY_WATCHES"
+	else
+		log "inotify: skipped"
+	fi
+}
+
+cmd_system() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--yes | -y) ASSUME_YES=1 ;;
+		*) die "system: unknown option: $1" ;;
+		esac
+		shift
+	done
+	command -v sudo >/dev/null || die "sudo is required"
+	[[ -t 0 || -n "$ASSUME_YES" ]] || die "system asks before each step; run it in a terminal or pass --yes"
+	sudo -v || die "sudo authentication failed"
+	system_packages
+	system_apparmor
+	system_inotify
+}
+
+cmd_uninstall() {
+	local running f
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		--yes | -y) ASSUME_YES=1 ;;
+		*) die "uninstall: unknown option: $1" ;;
+		esac
+		shift
+	done
+	if kdrive_running; then
+		running="$(running_appimage)"
+		[[ -n "$running" && "$running" != "$ACTIVE" ]] ||
+			die "kDrive is running; quit it from the tray first"
+	fi
+	confirm "Remove kDrive from $KDRIVE_DIR and the files $PROG installed? (accounts, config and synced files are kept)" ||
+		die "uninstall: cancelled"
+
+	NO_LOG_FILE=1
+	safe_rm "$KDRIVE_DIR" "$TOOL_DESKTOP" "$ICON_PATH" "$TMP_DIR" "$LOG_FILE"
+	if [[ -d "$BACKUP_DIR" ]] && [[ -n "$(ls -A -- "$BACKUP_DIR")" ]]; then
+		safe_rm "$LOCK_FILE"
+		log "kept config backups in $BACKUP_DIR (delete by hand if not needed)"
+	else
+		safe_rm "$STATE_DIR"
+	fi
+
+	if [[ -e "$APPARMOR_PROFILE" || -e "$SYSCTL_CONF" ]]; then
+		if confirm "Remove the AppArmor profile and inotify setting (sudo)?"; then
+			if [[ -e "$APPARMOR_PROFILE" ]]; then
+				sudo apparmor_parser -R -- "$APPARMOR_PROFILE" || true
+			fi
+			safe_rm --sudo "$APPARMOR_PROFILE" "$SYSCTL_CONF"
+			log "removed system additions (the inotify limit stays raised until reboot)"
+		else
+			log "kept $APPARMOR_PROFILE and $SYSCTL_CONF"
+		fi
+	fi
+
+	for f in "$KDRIVE_APP_DESKTOP" "$KDRIVE_AUTOSTART"; do
+		[[ "$(desktop_exec "$f")" == "$ACTIVE" ]] &&
+			log "note: kDrive's own $f still points to $ACTIVE (not touched; remove by hand or start another kDrive)"
+	done
+	# Last, so a failure above leaves the tool available to retry.
+	safe_rm "$BIN_PATH"
+	log "uninstalled"
+}
+
+main() {
+	if [[ "${1:-}" == --pause ]]; then
+		PAUSE=1
+		shift
+	fi
+	trap on_exit EXIT
+	local cmd="${1:-help}"
+	[[ $# -gt 0 ]] && shift
+	case "$cmd" in
+	install | update | rollback | system | uninstall)
+		acquire_lock
+		CLEANUP=1
+		"cmd_$cmd" "$@"
+		;;
+	status | doctor)
+		NO_LOG_FILE=1
+		"cmd_$cmd" "$@"
+		;;
+	version | --version | -V) printf '%s %s\n' "$PROG" "$VERSION" ;;
+	help | --help | -h) usage ;;
+	*)
+		usage >&2
+		die "unknown command: $cmd"
+		;;
+	esac
+}
+
+# Allow tests to source this file without running main.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

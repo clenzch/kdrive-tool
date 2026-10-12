@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: lists the secret service unless STUB_MISSING contains "secrets".
+[[ " ${STUB_MISSING:-} " == *" secrets "* ]] && exit 0
+echo 'org.freedesktop.secrets 5257 gnome-keyring-d user :1.1 user@1000.service - -'

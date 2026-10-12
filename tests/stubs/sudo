@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Test stub for sudo: never runs anything as root. File commands (tee, mkdir, chmod,
+# rm) run as the test user, and only if every path argument is inside $KDRIVE_SYSROOT.
+# Everything else (apt-get, apparmor_parser, sysctl) is only recorded in $SUDO_STUB_LOG.
+set -euo pipefail
+printf '%s\n' "$*" >>"${SUDO_STUB_LOG:-/dev/null}"
+[[ "${1:-}" == -v ]] && exit 0
+case "${1:-}" in
+tee | mkdir | chmod | rm)
+	for a in "${@:2}"; do
+		[[ "$a" == -* || "$a" =~ ^[0-7]+$ ]] && continue
+		[[ "$a" == "${KDRIVE_SYSROOT:?}"/* ]] || {
+			echo "sudo stub: refusing path outside sysroot: $a" >&2
+			exit 1
+		}
+	done
+	exec "$@"
+	;;
+esac
+exit 0

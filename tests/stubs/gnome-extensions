@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: lists the AppIndicator extension unless STUB_MISSING contains "appindicator".
+[[ " ${STUB_MISSING:-} " == *" appindicator "* ]] && exit 0
+echo 'ubuntu-appindicators@ubuntu.com'

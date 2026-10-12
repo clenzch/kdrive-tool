@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Test stub: record notifications.
+printf '%s\n' "$*" >>"${NOTIFY_STUB_LOG:-/dev/null}"

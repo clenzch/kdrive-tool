@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test stub: a package is installed unless its name is in STUB_MISSING_PKGS.
+pkg="${*: -1}"
+[[ " ${STUB_MISSING_PKGS:-} " == *" $pkg "* ]] && exit 1
+printf 'install ok installed'

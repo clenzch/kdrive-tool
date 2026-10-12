@@ -1,0 +1,26 @@
+{
+  "linux-amd64": {
+    "version": "3.8.8.1",
+    "versionstring": "3.8.8 (build 1)",
+    "web": [],
+    "downloadurl": "https://download.storage.infomaniak.com/drive/desktopclient/kDrive-3.8.8.1-amd64.AppImage"
+  },
+  "linux-arm64": {
+    "version": "3.8.8.1",
+    "versionstring": "3.8.8 (build 1)",
+    "web": [],
+    "downloadurl": "https://download.storage.infomaniak.com/drive/desktopclient/kDrive-3.8.8.1-arm64.AppImage"
+  },
+  "win32": {
+    "version": "3.8.7.1",
+    "versionstring": "3.8.7 (build 1)",
+    "web": [],
+    "downloadurl": "https://download.storage.infomaniak.com/drive/desktopclient/kDrive-3.8.7.1.exe"
+  },
+  "macos": {
+    "version": "3.8.7.1",
+    "versionstring": "3.8.7 (build 1)",
+    "web": [],
+    "downloadurl": "https://download.storage.infomaniak.com/drive/desktopclient/kDrive-3.8.7.1.pkg"
+  }
+}

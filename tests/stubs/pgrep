@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Test stub: PGREP_STUB_RUNNING=always -> kDrive always running; =N -> running for the
+# first N calls, then stopped (simulates the user quitting from the tray); unset -> not running.
+# When running, prints $PGREP_STUB_PID (default: a pid that does not exist).
+n="${PGREP_STUB_RUNNING:-0}"
+if [[ "$n" != always ]]; then
+	count=0
+	[[ -f "$PGREP_STUB_COUNT" ]] && read -r count <"$PGREP_STUB_COUNT"
+	count=$((count + 1))
+	echo "$count" >"$PGREP_STUB_COUNT"
+	((count <= n)) || exit 1
+fi
+echo "${PGREP_STUB_PID:-999999999}"

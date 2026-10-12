@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test stub: record the launch instead of starting anything. Flags an inherited fd 9
+# (the tool's lock), which a real kDrive would keep open for its whole lifetime.
+[[ -e /proc/$$/fd/9 ]] && echo "LOCK-FD-INHERITED" >>"${SETSID_STUB_LOG:-/dev/null}"
+printf '%s\n' "$*" >>"${SETSID_STUB_LOG:-/dev/null}"

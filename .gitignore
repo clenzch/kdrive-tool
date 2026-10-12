@@ -1,0 +1,4 @@
+*.AppImage
+*.AppImage.*
+*.log
+/tmp/
